@@ -5,30 +5,142 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/stat.h>
+#include <sys/select.h>
+#include <fcntl.h>
 
 #define PORT 8080
 #define ROOT "./www"
-#define AUTH_KEY "key"
 
-const char *HTML_404_PAGE = "HTTP/1.1 404 Not Found\r\n" "Content-Type: text/html\r\n" "Connection: close\r\n" "\r\n" "<!DOCTYPE html><html lang=\"ja\"><head><link rel=\"stylesheet\" href=\"/errors.css\"><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><meta charset=\"UTF-8\"><title>403 Forbidden</title></head><body>" "<div><h1>404</h1><h2>ページが見つかりません</h2><p>ページが存在していない可能性があります。</p><a href=\"/\">トップへ戻る</a></div>" "</body></html>";
-const char *HTML_403_PAGE = "HTTP/1.1 403 Forbidden\r\n" "Content-Type: text/html\r\n" "Connection: close\r\n" "\r\n" "<!DOCTYPE html><html lang=\"ja\"><head><link rel=\"stylesheet\" href=\"/errors.css\"><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><meta charset=\"UTF-8\"><title>403 Forbidden</title></head><body>" "<div><h1>403</h1><h2>アクセスが拒否されました</h2><p>このリソースを閲覧する権限がありません。</p><a href=\"/\">トップへ戻る</a></div>" "</body></html>";
-const char *HTML_500_PAGE = "HTTP/1.1 500 Internal Server Error\r\n" "Content-Type: text/html\r\n" "Connection: close\r\n" "\r\n" "<!DOCTYPE html><html lang=\"ja\"><head><link rel=\"stylesheet\" href=\"/errors.css\"><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><meta charset=\"UTF-8\"><title>500 Server Error</title></head><body>" "<div><h1>500</h1><h2>サーバーエラー</h2><p>予期せぬエラーが発生しました。時間を置いて再度お試しください。</p><a href=\"/\">トップへ戻る</a></div>" "</body></html>";
+const char *JSON_404 =
+    "HTTP/1.1 404 Not Found\r\n"
+    "Content-Type: application/json\r\n"
+    "Connection: close\r\n\r\n"
+    "{ \"error\": 404 }";
+
+const char *JSON_500 =
+    "HTTP/1.1 500 Internal Server Error\r\n"
+    "Content-Type: application/json\r\n"
+    "Connection: close\r\n\r\n"
+    "{ \"error\": 500 }";
 
 void send_header(int c, const char *type) {
-    char buf[256];
-    snprintf(buf, sizeof(buf),
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf),
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: %s\r\n"
         "Connection: close\r\n\r\n",
         type
     );
-    write(c, buf, strlen(buf));
+    write(c, buf, n);
+}
+
+int make_nonblock(int fd) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+
+void handle_request(int c, const char *req) {
+    printf("%s\n", req);
+
+    char firstline[512];
+    sscanf(req, "%511[^\r\n]", firstline);
+
+    char method[8], path[256];
+    if (sscanf(firstline, "%7s %255s", method, path) != 2) {
+        write(c, JSON_500, strlen(JSON_500));
+        return;
+    }
+
+    if (strcmp(method, "GET") != 0) {
+        write(c, JSON_404, strlen(JSON_404));
+        return;
+    }
+
+    char *q = strchr(path, '?');
+    if (q) *q = 0;
+
+    if (strstr(path, "..") != NULL) {
+        write(c, JSON_404, strlen(JSON_404));
+        return;
+    }
+
+    if (strstr(path, "//") != NULL) {
+        write(c, JSON_404, strlen(JSON_404));
+        return;
+    }
+
+    if (strcmp(path, "/") == 0)
+        strcpy(path, "/index.json");
+
+    char full[512];
+    snprintf(full, sizeof(full), "%s%s", ROOT, path);
+
+    struct stat st;
+    if (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) {
+        snprintf(full, sizeof(full), "%s%s/index.json", ROOT, path);
+    }
+
+    const char *ext = strrchr(full, '.');
+
+    //.shの処理
+    if (ext && strcmp(ext, ".sh") == 0) {
+        FILE *fp = popen(full, "r");
+        if (!fp) {
+            write(c, JSON_500, strlen(JSON_500));
+            return;
+        }
+
+        char header[256];
+        int hn = snprintf(header, sizeof(header),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "Connection: close\r\n\r\n");
+        write(c, header, hn);
+
+        const char *startmsg = "{'status' : 'started'}\n";
+        char szbuf[32];
+        int n = snprintf(szbuf, sizeof(szbuf), "%x\r\n", (int)strlen(startmsg));
+        write(c, szbuf, n);
+        write(c, startmsg, strlen(startmsg));
+        write(c, "\r\n", 2);
+
+        char buf[256];
+        while (fgets(buf, sizeof(buf), fp)) {
+            n = strlen(buf);
+            int cn = snprintf(szbuf, sizeof(szbuf), "%x\r\n", n);
+            write(c, szbuf, cn);
+            write(c, buf, n);
+            write(c, "\r\n", 2);
+        }
+
+        pclose(fp);
+        write(c, "0\r\n\r\n", 5);
+        return;
+    }
+
+    // 通常ファイルの処理
+    FILE *f = fopen(full, "rb");
+    if (!f) {
+        write(c, JSON_404, strlen(JSON_404));
+        return;
+    }
+
+    if (ext && strcmp(ext, ".json") == 0) send_header(c, "application/json");
+    else send_header(c, "application/octet-stream");
+
+    char buf[512];
+    int n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        write(c, buf, n);
+    }
+
+    fclose(f);
 }
 
 int main() {
-    printf("MicroHttp server is started.\n");
-
     int s = socket(AF_INET, SOCK_STREAM, 0);
+
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(PORT);
@@ -37,95 +149,52 @@ int main() {
     bind(s, (struct sockaddr*)&addr, sizeof(addr));
     listen(s, 5);
 
+    make_nonblock(s);
+
+    fd_set rfds;
+    int maxfd = s;
+
+    printf("MicroHttpi async minimal server.\n");
+
     while (1) {
-        int c = accept(s, NULL, NULL);
-        char req[1024] = {0};
-        read(c, req, 1023);
+        FD_ZERO(&rfds);
+        FD_SET(s, &rfds);
 
-        char method[8], path[256];
-        if (sscanf(req, "%7s %255s", method, path) != 2) {
-            write(c, HTML_500_PAGE, strlen(HTML_500_PAGE));
-            close(c);
+        // listen のみ監視
+        if (select(s + 1, &rfds, NULL, NULL, NULL) < 0)
             continue;
-        }
 
-        if (strcmp(method, "GET") != 0) {
-            write(c, HTML_404_PAGE, strlen(HTML_404_PAGE));
-            close(c);
-            continue;
-        }
+        if (FD_ISSET(s, &rfds)) {
+            int c = accept(s, NULL, NULL);
+            if (c < 0) continue;
 
-        char raw_path[256];
-        strcpy(raw_path, path);
+            make_nonblock(c);
 
-        char *q = strchr(path, '?');
-        if (q) *q = 0;
+            // ▼ ここ重要：クライアントのデータ到着を少し待つ
+            fd_set cfds;
+            FD_ZERO(&cfds);
+            FD_SET(c, &cfds);
 
-        if (strcmp(path, "/") == 0)
-            strcpy(path, "/index.html");
+            struct timeval tv;
+            tv.tv_sec = 0;
+            tv.tv_usec = 30000;   // 30ms（十分短い）
 
-        char full[512];
-        snprintf(full, sizeof(full), "%s%s", ROOT, path);
+            int rdy = select(c + 1, &cfds, NULL, NULL, &tv);
 
-        struct stat st;
-        if (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) {
-            snprintf(full, sizeof(full), "%s%s/index.html", ROOT, path);
-        }
+            char req[1024];
+            int n = 0;
 
-        const char *ext = strrchr(full, '.');
-
-        if (ext && strcmp(ext, ".sh") == 0) {
-
-            char required_auth[256];
-            snprintf(required_auth, sizeof(required_auth), "key=%s", AUTH_KEY);
-
-            if (strstr(raw_path, required_auth) == NULL) {
-                write(c, HTML_403_PAGE, strlen(HTML_403_PAGE));
-                close(c);
-                continue;
+            if (rdy > 0 && FD_ISSET(c, &cfds)) {
+                n = read(c, req, sizeof(req) - 1);
             }
 
-            char cmd[600];
-            snprintf(cmd, sizeof(cmd), "/bin/sh %s", full);
-
-            FILE *fp = popen(cmd, "r");
-            if (!fp) {
-                write(c, HTML_500_PAGE, strlen(HTML_500_PAGE));
-                close(c);
-                continue;
+            if (n > 0) {
+                req[n] = 0;
+                handle_request(c, req);
             }
 
-            send_header(c, "text/plain");
-
-            char out[256];
-            while (fgets(out, sizeof(out), fp)) {
-                write(c, out, strlen(out));
-            }
-            pclose(fp);
             close(c);
-            continue;
         }
-
-        FILE *f = fopen(full, "rb");
-        if (!f) {
-            write(c, HTML_404_PAGE, strlen(HTML_404_PAGE));
-            close(c);
-            continue;
-        }
-
-        if (ext && strcmp(ext, ".html") == 0) send_header(c, "text/html");
-        else if (ext && strcmp(ext, ".css") == 0) send_header(c, "text/css");
-        else if (ext && strcmp(ext, ".js") == 0) send_header(c, "text/javascript");
-        else send_header(c, "application/octet-stream");
-
-        char buf[512];
-        int n;
-        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-            write(c, buf, n);
-        }
-
-        fclose(f);
-        close(c);
     }
 
     return 0;
