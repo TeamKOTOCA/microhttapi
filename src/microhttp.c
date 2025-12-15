@@ -7,6 +7,9 @@
 #include <sys/stat.h>
 #include <sys/select.h>
 #include <fcntl.h>
+#include <string.h>
+#include <ctype.h>
+#include "sha256.h"
 
 #define PORT 8080
 #define ROOT "./www"
@@ -81,6 +84,68 @@ void handle_request(int c, const char *req) {
     }
 
     const char *ext = strrchr(full, '.');
+
+    //クエリ分離
+    char *qmark = strchr(firstline, '?');
+    char query[256];
+    if (qmark) {
+        size_t plen = qmark - firstline;
+        strncpy(path, firstline, plen);
+        path[plen] = 0;
+        strcpy(query, qmark + 1);
+    } else {
+        strcpy(path, firstline);
+    }
+
+    char key[128], value[128];
+    char *pair = strtok(query, "&");
+    //以下のヘッダーの検証処理でだめな点があれば増える
+    //一の位...そのキーが存在するか。
+    //１０の位...そのキーの形式が正しいか。
+    int bad_header = 0;
+    while (pair) {
+        if (sscanf(pair, "%127[^=]=%127s", key, value) == 2) {
+            if (strcmp(key, "nonce") == 0) {
+                bad_header += 1;
+                //16進文字列か確認
+                for (int i = 0; value[i]; i++) {
+                    if (!isxdigit(value[i])){
+                        bad_header += 10;
+                    };
+                }
+            } else if (strcmp(key, "ts") == 0) {
+                bad_header += 2;
+                // ts は数字のみか確認
+                for (int i = 0; value[i]; i++) {
+                    if (!isdigit(value[i])){
+                        bad_header += 20;
+                    };
+                }
+            } else if (strcmp(key, "hmac") == 0) {
+                bad_header += 3;
+                // hmac は64文字の16進文字列（SHA256ハッシュ）か確認
+                if (strlen(value) != 64){
+                    bad_header += 40;
+                };
+                for (int i = 0; value[i]; i++) {
+                    if (!isxdigit(value[i])){
+                        bad_header += 30;
+                    };
+                }
+            }
+        }
+        pair = strtok(NULL, "&");
+    }
+    char error_message[256];
+    int len;
+    len = snprintf(error_message, sizeof(error_message), 
+                    "header code: %d\n", bad_header);
+    if (len > 0) {
+        write(1, error_message, (size_t)len);
+    }
+    if(bad_header != 6){
+        return;
+    }
 
     //.shの処理
     if (ext && strcmp(ext, ".sh") == 0) {
