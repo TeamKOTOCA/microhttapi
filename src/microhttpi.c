@@ -42,163 +42,101 @@ int make_nonblock(int fd) {
     return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
-void handle_request(int c, const char *req) {
-    printf("%s\n", req);
+void handle_request(int c, char *line) {
+    printf("REQ: %s\n", line);
 
-    char firstline[512];
-    sscanf(req, "%511[^\r\n]", firstline);
+    // 改行除去
+    char *nl = strpbrk(line, "\r\n");
+    if (nl) *nl = 0;
 
-    char method[8], path[256];
-    if (sscanf(firstline, "%7s %255s", method, path) != 2) {
-        write(c, JSON_500, strlen(JSON_500));
+    // 先頭はパス
+    char path[256];
+    char params[512];
+
+    if (sscanf(line, "%255s %511[^\n]", path, params) < 1) {
+        write(c, "ERR bad format\n", 15);
         return;
     }
 
-    if (strcmp(method, "GET") != 0) {
-        write(c, JSON_404, strlen(JSON_404));
-        return;
-    }
-
-    char *q = strchr(path, '?');
-    if (q) *q = 0;
-
-    if (strstr(path, "..") != NULL) {
-        write(c, JSON_404, strlen(JSON_404));
-        return;
-    }
-
-    if (strstr(path, "//") != NULL) {
-        write(c, JSON_404, strlen(JSON_404));
+    if (strstr(path, "..") || strstr(path, "//")) {
+        write(c, "ERR invalid path\n", 17);
         return;
     }
 
     if (strcmp(path, "/") == 0)
         strcpy(path, "/index.json");
 
-    char full[512];
-    snprintf(full, sizeof(full), "%s%s", ROOT, path);
+    /* --- クエリ解析 --- */
 
-    struct stat st;
-    if (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) {
-        snprintf(full, sizeof(full), "%s%s/index.json", ROOT, path);
-    }
-
-    const char *ext = strrchr(full, '.');
-
-    //クエリ分離
-    char *qmark = strchr(firstline, '?');
-    char query[256];
-    if (qmark) {
-        size_t plen = qmark - firstline;
-        strncpy(path, firstline, plen);
-        path[plen] = 0;
-        strcpy(query, qmark + 1);
-    } else {
-        strcpy(path, firstline);
-    }
+    char query[512] = {0};
+    if (strchr(line, ' '))
+        strcpy(query, params);
 
     char key[128], value[128];
-    char *pair = strtok(query, "&");
-    //以下のヘッダーの検証処理でだめな点があれば増える
-    //一の位...そのキーが存在するか。
-    //１０の位...そのキーの形式が正しいか。
-    int bad_header = 0;
+    int keys_nonce = 0, keys_ts = 0, keys_hmac = 0;
+
+    char *pair = strtok(query, " ");
     while (pair) {
         if (sscanf(pair, "%127[^=]=%127s", key, value) == 2) {
             if (strcmp(key, "nonce") == 0) {
-                bad_header += 1;
-                //16進文字列か確認
-                for (int i = 0; value[i]; i++) {
-                    if (!isxdigit(value[i])){
-                        bad_header += 10;
-                    };
-                }
-            } else if (strcmp(key, "ts") == 0) {
-                bad_header += 2;
-                // ts は数字のみか確認
-                for (int i = 0; value[i]; i++) {
-                    if (!isdigit(value[i])){
-                        bad_header += 20;
-                    };
-                }
-            } else if (strcmp(key, "hmac") == 0) {
-                bad_header += 3;
-                // hmac は64文字の16進文字列（SHA256ハッシュ）か確認
-                if (strlen(value) != 64){
-                    bad_header += 40;
-                };
-                for (int i = 0; value[i]; i++) {
-                    if (!isxdigit(value[i])){
-                        bad_header += 30;
-                    };
-                }
+                keys_nonce += 1;
+                for (int i = 0; value[i]; i++)
+                    if (!isxdigit(value[i])) keys_nonce += 10;
+            }
+            else if (strcmp(key, "ts") == 0) {
+                keys_ts += 1;
+                for (int i = 0; value[i]; i++)
+                    if (!isdigit(value[i])) keys_ts += 10;
+            }
+            else if (strcmp(key, "hmac") == 0) {
+                keys_hmac += 1;
+                if (strlen(value) != 64) keys_hmac += 10;
+                for (int i = 0; value[i]; i++)
+                    if (!isxdigit(value[i])) keys_hmac += 10;
             }
         }
-        pair = strtok(NULL, "&");
+        pair = strtok(NULL, " ");
     }
-    char error_message[256];
-    int len;
-    len = snprintf(error_message, sizeof(error_message), 
-                    "header code: %d\n", bad_header);
-    if (len > 0) {
-        write(1, error_message, (size_t)len);
-    }
-    if(bad_header != 6){
+
+    dprintf(c, "header code: %d %d %d\n", keys_nonce,keys_ts,keys_hmac);
+
+    if (keys_nonce != 1 && keys_ts != 1 && keys_hmac != 1 ) {
+        write(c, "ERR auth failed\n", 16);
         return;
     }
 
-    //.shの処理
+    /* --- ファイル処理 --- */
+
+    char full[512];
+    snprintf(full, sizeof(full), "%s%s", ROOT, path);
+
+    const char *ext = strrchr(full, '.');
+
     if (ext && strcmp(ext, ".sh") == 0) {
         FILE *fp = popen(full, "r");
         if (!fp) {
-            write(c, JSON_500, strlen(JSON_500));
+            write(c, "ERR exec failed\n", 16);
             return;
         }
 
-        char header[256];
-        int hn = snprintf(header, sizeof(header),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain\r\n"
-            "Transfer-Encoding: chunked\r\n"
-            "Connection: close\r\n\r\n");
-        write(c, header, hn);
-
-        const char *startmsg = "{'status' : 'started'}\n";
-        char szbuf[32];
-        int n = snprintf(szbuf, sizeof(szbuf), "%x\r\n", (int)strlen(startmsg));
-        write(c, szbuf, n);
-        write(c, startmsg, strlen(startmsg));
-        write(c, "\r\n", 2);
-
         char buf[256];
-        while (fgets(buf, sizeof(buf), fp)) {
-            n = strlen(buf);
-            int cn = snprintf(szbuf, sizeof(szbuf), "%x\r\n", n);
-            write(c, szbuf, cn);
-            write(c, buf, n);
-            write(c, "\r\n", 2);
-        }
+        while (fgets(buf, sizeof(buf), fp))
+            write(c, buf, strlen(buf));
 
         pclose(fp);
-        write(c, "0\r\n\r\n", 5);
         return;
     }
 
-    // 通常ファイルの処理
     FILE *f = fopen(full, "rb");
     if (!f) {
-        write(c, JSON_404, strlen(JSON_404));
+        write(c, "ERR not found\n", 14);
         return;
     }
-
-    if (ext && strcmp(ext, ".json") == 0) send_header(c, "application/json");
-    else send_header(c, "application/octet-stream");
 
     char buf[512];
     int n;
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
         write(c, buf, n);
-    }
 
     fclose(f);
 }
@@ -219,13 +157,12 @@ int main() {
     fd_set rfds;
     int maxfd = s;
 
-    printf("MicroHttpi async minimal server.\n");
+    printf("MicroHttpi started.\n");
 
     while (1) {
         FD_ZERO(&rfds);
         FD_SET(s, &rfds);
 
-        // listen のみ監視
         if (select(s + 1, &rfds, NULL, NULL, NULL) < 0)
             continue;
 
@@ -235,27 +172,24 @@ int main() {
 
             make_nonblock(c);
 
-            // ▼ ここ重要：クライアントのデータ到着を少し待つ
             fd_set cfds;
             FD_ZERO(&cfds);
             FD_SET(c, &cfds);
 
             struct timeval tv;
             tv.tv_sec = 0;
-            tv.tv_usec = 30000;   // 30ms（十分短い）
+            tv.tv_usec = 50000; //50ms
 
             int rdy = select(c + 1, &cfds, NULL, NULL, &tv);
 
             char req[1024];
             int n = 0;
-
             if (rdy > 0 && FD_ISSET(c, &cfds)) {
                 n = read(c, req, sizeof(req) - 1);
             }
-
-            if (n > 0) {
-                req[n] = 0;
-                handle_request(c, req);
+            if (n <= 0) {
+                close(c);
+                continue;
             }
 
             close(c);
