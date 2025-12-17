@@ -1,10 +1,8 @@
 {
     "status": "ok",
-    "timestamp": 1733480000,
     "data": {
         "server": "microhttp",
         "version": "1.0.0",
-        "message": "Request processed successfully",
-        "request_id": "f3a9c2d1-7b55-42aa-b57b-9dbe120ea541"
+        "message": "Request processed successfully"
     }
 }
